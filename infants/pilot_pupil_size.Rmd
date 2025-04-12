@@ -1,0 +1,718 @@
+---
+title: "Altercentric pupils - pilot"
+author: LL
+output: pdf_document
+date: `11/04/2025`
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#rm(list=c("try"))
+#rm(list=ls())
+library(tidyverse)
+library(arrow)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(summarytools)
+library(exactRankTests)
+library(lme4)
+library(naniar)
+#library(devtools)
+remotes::install_github("dmirman/gazer")
+library(gazer)
+library(zoo)
+library(wesanderson)
+library(gcookbook)
+source("functions/diagnostic_fcns.r")
+source("functions/glmm_stability.r")
+source("functions/boot_glmm.r")
+
+
+library(itsadug)
+packageVersion("itsadug")
+library(plotfunctions)
+packageVersion("plotfunctions")
+library(colorspace)
+packageVersion("colorspace")
+## Define colors:
+col1 <- 'pink1'
+col2 <- 'black'
+col3 <- 'indianred'
+```
+
+
+## Load data
+
+```{r}
+## time.frame for interpolation
+max.time <- 15367 #occ act
+min.time <- 0
+time <- seq(from = min.time, to = max.time, by = 1)
+xx <- as.data.frame(time)
+str(xx)
+
+baseline.end<-8517 #occ act
+#frozen frame with actress looking at unoccluded platform (from both POVs) with or without object, after hand has disappeared (whole video IP time, in ms)
+
+#this will be counterbalancing file
+# demo.data <- read_csv("experiment_2/data/Woodward_2022_counterbalancing.csv") %>%
+#   mutate(
+#     EDF1 = fct_recode(
+#       as.factor(EDF1),
+#       "Georgia_1" = "Georgia1",
+#     )
+#   ) %>%
+#   separate(EDF1, c("subject", "num"), sep = "_")%>%
+#   select(-num)
+```
+
+```{r}
+#convert sample data to parquet
+#sample reports saved on Toshiba drive
+
+wd <- "D:/altercentric_pupil/DataViewingSession_altercentric_pupils_infants/Output"
+xdata<-read.table(file.path(wd, "sample_report_whole_video.txt"), sep ="\t", header = TRUE) 
+str(xdata)
+
+xdata2<-xdata %>%
+  select(RECORDING_SESSION_LABEL, TRIAL_INDEX, IP_LABEL, IP_START_TIME, IP_DURATION, HTARGET_DISTANCE, RIGHT_GAZE_X, RIGHT_GAZE_Y, RIGHT_INTEREST_AREAS, RIGHT_INTEREST_AREA_DATA, RIGHT_INTEREST_AREA_ID, RIGHT_INTEREST_AREA_LABEL, RIGHT_INTEREST_AREA_PIXEL_AREA, RIGHT_IN_BLINK, RIGHT_IN_SACCADE, RIGHT_PUPIL_SIZE, SAMPLE_INDEX, SAMPLE_MESSAGE, SAMPLING_RATE, TIMESTAMP, TRIAL_START_TIME, VIDEO_FRAME_INDEX, fixation_trigger, sound_file, Trial_Index_, trial_number, condition, counterb_id, video_file, duration_video, bg_name)
+
+write_parquet(xdata2, "sample_report_whole_video.parquet")
+
+sample.data<-read_parquet("./data/sample_report_whole_video.parquet")
+```
+
+load sample data and add the demographic data
+```{r}
+sample.data<-read_parquet("./data/sample_report_whole_video.parquet") %>%
+  #exclude trials that were not shown due to experimenters interrupting the experiment 
+  #(due to malfunction or fussiness)
+  filter(!(RECORDING_SESSION_LABEL == "pilot2" & trial_number == 2), 
+         !(RECORDING_SESSION_LABEL == "pilot4" & trial_number == 17),
+         !(RECORDING_SESSION_LABEL == "pilot6" & trial_number == 9),
+         !(RECORDING_SESSION_LABEL == "pilot7" & trial_number == 5),
+         !(RECORDING_SESSION_LABEL == "pilot14" & trial_number == 3),
+         !(RECORDING_SESSION_LABEL == "pilot16" & trial_number == 14),
+         !(RECORDING_SESSION_LABEL == "pilot18" & trial_number == 6)) %>% 
+  mutate(condition_trial = paste(condition, "_", Trial_Index_)) %>%
+  filter(trial_number != 11)%>% #skip cartoon
+ # full_join(demo.data)%>%
+  mutate(time = TIMESTAMP - IP_START_TIME) %>% 
+  mutate( # Remove .mp4 and split by underscore
+    name_no_ext = str_remove(video_file, "\\.mp4$"),
+    parts = str_split(name_no_ext, "_")
+  ) %>%
+  mutate(
+    perspective = map_chr(parts, ~ paste(.x[1:2], collapse = "_")),
+    toy = map_chr(parts, ~ .x[3]),
+    object_presence = map_chr(parts, ~ .x[4]),
+    agent_side = map_chr(parts, ~ ifelse("mirrored" %in% .x, "right", "left")),
+    
+    # Replace shorthand values with full labels
+    perspective = case_when(
+      perspective == "occ_act" ~ "occlusion_from_actor",
+      perspective == "occ_part" ~ "occlusion_from_participant",
+      perspective == "occ_neith" ~ "occlusion_from_neither",
+      TRUE ~ perspective
+    ),
+    object_presence = case_when(
+      object_presence == "abs" ~ "absent",
+      object_presence == "pres" ~ "present",
+      TRUE ~ object_presence
+    )
+  ) %>%
+  select(-name_no_ext, -parts)
+```
+
+
+```{r}
+#data checks and preparation
+str(sample.data)
+levels(as.factor(sample.data$counterb_id))
+table(sample.data$RECORDING_SESSION_LABEL,sample.data$trial_number)
+
+table(sample.data$RECORDING_SESSION_LABEL,sample.data$condition)
+table(sample.data$counterb_id,sample.data$agent_side)
+table(sample.data$counterb_id,sample.data$toy)
+summary(sample.data$time)
+summary(sample.data$VIDEO_FRAME_INDEX)
+
+sample.data$RIGHT_PUPIL_SIZE<-as.numeric(sample.data$RIGHT_PUPIL_SIZE)
+summary(sample.data$RIGHT_PUPIL_SIZE)
+sample.data$RIGHT_GAZE_X<-as.numeric(sample.data$RIGHT_GAZE_X)
+summary(sample.data$RIGHT_GAZE_X)
+sample.data$RIGHT_GAZE_Y<-as.numeric(sample.data$RIGHT_GAZE_Y)
+summary(sample.data$RIGHT_GAZE_Y)
+```
+Explore pupil size data
+```{r}
+#set IPs
+
+# baseline
+bs.beg.occ.part<-6.5
+bs.end.occ.part<-7.5
+bs.beg.occ.act<-8.5
+bs.end.occ.act<-9.5
+bs.beg.occ.neith<-8.5
+bs.end.occ.neith<-9.5
+  
+#object presence manipulation
+beg.occ.part<- 3
+end.occ.part<- bs.beg.occ.part
+beg.occ.act<- 5.5
+end.occ.act<- bs.beg.occ.act
+beg.occ.neith<- 5
+end.occ.neith<- bs.beg.occ.neith
+  
+baseline.ip.data<-sample.data %>%
+mutate(time_sec=time/1000) %>%
+  filter(
+    (grepl("act", condition)   & time_sec >= bs.beg.occ.act   & time_sec <= bs.end.occ.act) |
+    (grepl("part", condition)  & time_sec >= bs.beg.occ.part  & time_sec <= bs.end.occ.part) |
+    (grepl("neith", condition) & time_sec >= bs.beg.occ.neith & time_sec <= bs.end.occ.neith)
+  )
+
+#check how many trials we would have to exclude if we only keep trials with at least 50% gaze samples tracked during measuring IP (i.e., 2 out of 4 seconds)
+baseline.ip.data.trials<-baseline.ip.data %>% 
+  group_by(RECORDING_SESSION_LABEL, trial_number) %>% 
+  summarise(tot_number_expected_samples=length(time_sec),
+            collected_samples=sum(!is.na(RIGHT_PUPIL_SIZE)),
+            prop.valid.samples=collected_samples/tot_number_expected_samples)
+
+sum(baseline.ip.data.trials$prop.valid.samples<=0.5)
+mean(baseline.ip.data.trials$prop.valid.samples)
+```
+```{r}
+# object manipulation IP
+object.ip.data <- sample.data %>%
+  mutate(time_sec=time/1000) %>% 
+ filter(
+    (grepl("act", condition)   & time_sec >= beg.occ.act   & time_sec <= end.occ.act) |
+    (grepl("part", condition)  & time_sec >= beg.occ.part  & time_sec <= end.occ.part) |
+    (grepl("neith", condition) & time_sec >= beg.occ.neith & time_sec <= end.occ.neith)
+  )
+
+#check data loss in specific IPs
+object.ip.data$RIGHT_PUPIL_SIZE<-as.numeric(object.ip.data$RIGHT_PUPIL_SIZE)
+summary(object.ip.data$RIGHT_PUPIL_SIZE)
+30813/length(object.ip.data$RIGHT_PUPIL_SIZE) #prop. NAs over total samples #25%
+ 
+#check how many trials we would have to exclude if we only keep trials with at least 50% gaze samples tracked during measuring IP (i.e., 2 out of 4 seconds)
+object.ip.data.trials<-object.ip.data %>% 
+  group_by(RECORDING_SESSION_LABEL, trial_number) %>% 
+  summarise(tot_number_expected_samples=length(time_sec),
+            collected_samples=sum(!is.na(RIGHT_PUPIL_SIZE)),
+            prop.valid.samples=collected_samples/tot_number_expected_samples)
+
+sum(object.ip.data.trials$prop.valid.samples<=0.5)#12 trials to be excluded 
+12/length(object.ip.data.trials$tot_number_expected_samples) #7%
+
+mean(object.ip.data.trials$prop.valid.samples)
+```
+
+
+```{r}
+# measuring IP
+measuring.ip.data <- sample.data %>%
+  mutate(time_sec=time/1000) %>% 
+  group_by(RECORDING_SESSION_LABEL, trial_number) %>%
+  mutate(max_time_sec = max(time_sec)) %>%
+  filter(time_sec >= max_time_sec - 4 & time_sec <= max_time_sec) %>%
+  ungroup() #%>%
+  #select(-max_time_sec)  # optional: remove if not needed
+
+#check data loss in specific IPs
+measuring.ip.data$RIGHT_PUPIL_SIZE<-as.numeric(measuring.ip.data$RIGHT_PUPIL_SIZE)
+summary(measuring.ip.data$RIGHT_PUPIL_SIZE)
+ 84439/length(measuring.ip.data$RIGHT_PUPIL_SIZE) #prop. NAs over total samples #25%
+ 
+#check how many trials we would have to exclude if we only keep trials with at least 50% gaze samples tracked during measuring IP (i.e., 2 out of 4 seconds)
+measuring.ip.data.trials<-measuring.ip.data %>% 
+  group_by(RECORDING_SESSION_LABEL, trial_number) %>% 
+  summarise(tot_number_expected_samples=length(time_sec),
+            collected_samples=sum(!is.na(RIGHT_PUPIL_SIZE)),
+            prop.valid.samples=collected_samples/tot_number_expected_samples)
+
+sum(measuring.ip.data.trials$prop.valid.samples<=0.5)#36 samples to be excluded 
+36/length(measuring.ip.data.trials$tot_number_expected_samples)
+
+mean(measuring.ip.data.trials$prop.valid.samples)
+```
+
+##LL: OLD, adapt frm here. Artefacts check
+*Plot raw data
+```{r}
+raw_plot_pupil<-ggplot(data = sample.data, aes(x = time, y = RIGHT_PUPIL_SIZE)) +
+  ylab("Pupil size") +
+  xlab("Time (in ms)") +
+  geom_point(aes(color = condition), alpha = 0.3, size = 0.5) +
+  facet_grid(agent~subject)+
+  xlim(0, 22000) +
+    theme_bw()+
+  scale_color_manual(values=wes_palette("Zissou1")[c(1,4)], labels= c("new goal","new side"))+
+  scale_fill_manual(values=wes_palette("Zissou1")[c(1,4)], labels= c("new goal","new side"))+
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_blank(), legend.position = c(0.9, 0.9), legend.text=element_text(size=12))
+
+raw_plot_pupil
+
+ggsave(raw_plot_pupil, filename = "graphs/raw_plot_pupil.png", width=12, height=8)
+```
+*Plot raw data only in the IP of the baseline + analysis
+```{r}
+raw_plot_pupil_IP<-ggplot(data = sample.data, aes(x = time, y = RIGHT_PUPIL_SIZE)) +
+  ylab("Pupil size") +
+  xlab("Time (in ms)") +
+  geom_point(aes(color = condition), alpha = 0.3, size = 0.5) +
+  geom_vline(xintercept = 4000,linetype="longdash", colour="gray")+
+  geom_vline(xintercept = 3000,linetype="longdash", colour="grey")+
+  annotate("rect", xmin = 3000, xmax = 4000, ymin = 0, ymax = 15000,
+           alpha = .3,fill = "grey")+
+  facet_grid(agent~subject)+
+  xlim(3000, 8001) +
+  theme_bw()+
+  scale_color_manual(values=wes_palette("Zissou1")[c(1,4)], labels= c("new goal","new side"))+
+  scale_fill_manual(values=wes_palette("Zissou1")[c(1,4)], labels= c("new goal","new side"))+
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_blank(), legend.position = c(0.9, 0.9), legend.text=element_text(size=12),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+raw_plot_pupil_IP
+
+ggsave(raw_plot_pupil_IP, filename = "graphs/raw_plot_pupil_IP.png", width=12, height=8)
+```
+
+
+* Plot with blink artefacts removed
+```{r }
+sample.data<-sample.data%>%
+        mutate(RIGHT_PUPIL_SIZE_no_blinks=extend_blinks(RIGHT_PUPIL_SIZE,  hz=1000, fillback=100, fillforward=100))#Extends blinks
+
+
+artefact_check <-
+  ggplot(data = sample.data,
+         aes(x = time, y = RIGHT_PUPIL_SIZE_no_blinks)) +
+  ylab("Pupil size") +
+  xlab("Time (in ms)") +
+  geom_point(aes(color = condition), alpha = 0.3, size = 0.5) +
+  facet_grid(agent ~ subject) +
+  xlim(0, 22000) +
+  theme_bw() +
+  scale_color_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                     labels = c("new goal", "new side")) +
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                    labels = c("new goal", "new side")) +
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.title = element_blank(), legend.position = c(0.9, 0.9), legend.text=element_text(size=14))
+
+
+artefact_check
+
+ggsave(artefact_check, filename = "graphs/artefact_check_100.png", width=12, height=8, dpi=600)
+```
+
+* Plot with blink artefacts removed only in the IP of the baseline + analysis
+```{r}
+artefact_check_IP <-
+  ggplot(data = sample.data,
+         aes(x = time, y = RIGHT_PUPIL_SIZE_no_blinks)) +
+  ylab("Pupil size") +
+  xlab("Time (in ms)") +
+  geom_point(aes(color = condition), alpha = 0.3, size = 0.5) +
+  geom_vline(xintercept = 4000,linetype="longdash", colour="grey")+
+  geom_vline(xintercept = 3000,linetype="longdash", colour="grey")+
+  annotate("rect", xmin = 3000, xmax = 4000, ymin = 0, ymax = 15000,
+           alpha = .3,fill = "grey")+
+  facet_grid(agent ~ subject) +
+  xlim(3000, 8001) +
+  theme_bw() +
+  scale_color_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                     labels = c("new goal", "new side")) +
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                    labels = c("new goal", "new side")) +
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    legend.title = element_blank(), legend.position = c(0.9, 0.9), legend.text=element_text(size=14),
+     axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+
+artefact_check_IP
+
+ggsave(artefact_check_IP, filename = "graphs/artefact_check_IP.png", width=12, height=8, dpi=600)
+
+```
+
+
+##Proportion of valid data
+```{r}
+prop.tracked.data<-sample.data%>%
+  group_by(subject, trial_number)%>%
+  summarise(length=length(RIGHT_PUPIL_SIZE_no_blinks), sum_noNA=sum(!is.na(RIGHT_PUPIL_SIZE_no_blinks)), prop=sum(!is.na(RIGHT_PUPIL_SIZE_no_blinks))/length(RIGHT_PUPIL_SIZE_no_blinks), min(RIGHT_PUPIL_SIZE), max(RIGHT_PUPIL_SIZE))
+prop.tracked.data
+mean(prop.tracked.data$prop) #mean eye-detected-time
+```
+
+
+```{r}
+prop.tracked.data%>%group_by(subject, trial_number)%>%summarise(min(prop))
+#this confirms that 2 test trials (Juna session 2 and Maylo session 3) have less than 70% tracked data (46% and 64% respectively)
+
+prop.tracked.gaze.data<-sample.data%>%
+  filter(RIGHT_GAZE_X<1024&RIGHT_GAZE_X>0&RIGHT_GAZE_Y<768&RIGHT_GAZE_Y>0)%>%
+  group_by(subject, trial_number)%>%
+  summarise(prop=sum(!is.na(RIGHT_GAZE_X))/max(time))
+prop.tracked.gaze.data
+mean(prop.tracked.gaze.data$prop) #mean on-screen-looking time
+
+prop.tracked.gaze.data%>%group_by(subject)%>%summarise(min(prop), mean(prop))
+#for Edgar_2 the eye was detected 93% of the trial time but it was only inside the video area for 66% of the time; 
+#Joker_1 eye detected:94%; on screen:67%
+#Timo_3 eye detected: 98%; on screen:68%
+
+```
+* Plot distribution of pupil sizes
+```{r}
+puphist <-
+  ggplot(sample.data
+    #  %>% filter(subject != "Juna" | num != "2") %>%
+    #                 filter(subject != "Maylo" | num != "3")
+    ,
+    aes(x = RIGHT_PUPIL_SIZE_no_blinks)) +
+    geom_histogram(aes(y = ..count..),
+                     colour = "green", binwidth = 0.5)  +
+  xlab("Pupil Size") + ylab("Count") + theme_bw()
+puphist
+```
+## Preprocessing: interpolation, baseline correction, down sampling
+```{r}
+sample.data.no.missing<-sample.data%>% filter(subject != "Juna" | trial_number != "2") %>%
+                            filter(subject != "Maylo" | trial_number != "3") #exclude the 2 test trials in which the eye was not tracked for more than 30% of the trial time
+#check
+table(sample.data.no.missing$subject, sample.data.no.missing$trial_number)
+table(sample.data$subject, sample.data$trial_number)
+
+
+# determine baseline
+exp.data.pupil.base <- sample.data %>%
+  filter(time < baseline.end & time > (baseline.end-1000)) %>% 
+    group_by(subject, trial_number) %>%
+  summarise(median.base.pupil = median(RIGHT_PUPIL_SIZE_no_blinks, na.rm = TRUE))
+
+#preprocessing
+exp.data.pupil.processed <- sample.data %>%
+  filter(time<max.time)%>%
+  select(subject, time, trial_number, condition, agent, RIGHT_GAZE_X, RIGHT_GAZE_Y, RIGHT_PUPIL_SIZE_no_blinks) %>%
+  group_by(subject, trial_number, time) %>%
+  full_join(xx%>%select(time)) %>% #add missing time.frames
+  ungroup() %>%
+  group_by(subject, trial_number) %>%
+  mutate(pupil.inter = na.approx(RIGHT_PUPIL_SIZE_no_blinks, na.rm = FALSE, maxgap = 500)) %>% #linear interpolation
+  full_join(exp.data.pupil.base) %>% #add baseline data
+  mutate(pupil.base.corrected = pupil.inter - median.base.pupil)%>% #subtractive baseline correction
+  ungroup()%>%
+    mutate(bin = cut(time, seq(min(time), max(time), 100), right = FALSE))%>% #addition of time bins (100 ms = 10 hz)
+  separate(bin, c("bin_low", "bin_high"), sep=",", remove=FALSE)%>%
+  select(-bin_high)%>%
+  mutate(bin_low=as.numeric(str_replace_all(bin_low, "\\[|\\]", "")))
+  
+#down sampling to 10hz using median values:
+exp.data.pupil.processed.downsampled <- exp.data.pupil.processed %>%  
+  group_by(subject, condition, agent, trial_number, bin_low)%>%
+  summarise(pupil.base.corrected.binned=median(pupil.base.corrected), Xgaze=median(RIGHT_GAZE_X), Ygaze=median(RIGHT_GAZE_Y))%>%
+  filter(!is.na(subject))%>%
+  ungroup()
+```
+
+
+* Plot interpolated data: individual level
+```{r}
+exp.data.pupil.processed.downsampled2 <-
+  exp.data.pupil.processed.downsampled %>%
+  mutate(condition = fct_recode(condition, "New goal" = "new_goal", "New side" =
+                                  "new_side"))
+
+plot.woodward.pupil.individual<-ggplot(data = exp.data.pupil.processed.downsampled2, aes(x = bin_low, y =pupil.base.corrected.binned )) +
+  ylab("Pupil size ") +
+  xlab("Time (in ms)") +
+    geom_vline(aes(xintercept=baseline.end), lty=2, alpha=0.3)+
+  geom_point(aes(color = as.factor(condition)), alpha = 0.8, size = 0.5) +
+  geom_line(aes(color = as.factor(condition)), alpha = 0.8) +
+  facet_grid(agent~subject)+
+  xlim(0, 22000) +
+    theme_bw()+
+    scale_color_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                     labels = c("New goal", "New side")) +
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                    labels = c("New goal", "New side")) +
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_blank(), legend.position = c(0.9,0.9),
+        legend.key.size = unit(0.2, "cm"))
+
+plot.woodward.pupil.individual
+ggsave(plot.woodward.pupil.individual, filename = "graphs/pupil_processed_baseline_corrected_individual.png", height = 7, width = 20, scale = 1)
+```
+* Plot interpolated data: individual level, only in the IP
+```{r}
+plot.woodward.pupil.individual_IP<-ggplot(data = exp.data.pupil.processed.downsampled2, aes(x = bin_low, y =pupil.base.corrected.binned )) +
+  ylab("Pupil size ") +
+  xlab("Time (in ms)") +
+  geom_vline(aes(xintercept=baseline.end), lty=2, alpha=0.3)+
+  geom_vline(aes(xintercept=3000), lty=2, alpha=0.3)+
+  annotate("rect", xmin = 3000, xmax = 4000, ymin = 0, ymax = 15000,
+           alpha = .3,fill = "grey")+
+  geom_point(aes(color = as.factor(condition)), alpha = 0.8, size = 0.5) +
+  geom_line(aes(color = as.factor(condition)), alpha = 0.8) +
+  facet_grid(agent~subject)+
+  xlim(3000, 8001) +
+    theme_bw()+
+    scale_color_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                     labels = c("New goal", "New side")) +
+  scale_fill_manual(values = wes_palette("Zissou1")[c(1, 4)],
+                    labels = c("New goal", "New side")) +
+  guides(colour = guide_legend(override.aes = list(size=4)))+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_blank(), legend.position = c(0.9,0.9),
+        legend.key.size = unit(0.2, "cm"))
+
+plot.woodward.pupil.individual_IP
+ggsave(plot.woodward.pupil.individual, filename = "graphs/pupil_processed_baseline_corrected_individual_IP.png", height = 7, width = 20, scale = 1, dpi=600)
+```
+# Plot group level data 
+```{r}
+
+pupil.group.level <- exp.data.pupil.processed.downsampled2 %>%
+  #mutate(TRIAL_LABEL=recode(TRIAL_LABEL, "Trial: 1"="Trial 1", "Trial: 2"="Trial 2"))%>%
+  group_by(bin_low, condition, agent) %>%
+  summarise(mean.pupil.corrected.binned = mean(pupil.base.corrected.binned, na.rm = TRUE), sd.pupil.corrected.binned= sd(pupil.base.corrected.binned, na.rm = TRUE), se.pupil.corrected.binned = sd(pupil.base.corrected.binned, na.rm = TRUE) / sqrt(length(pupil.base.corrected.binned)))
+
+plot.woodward.pupil.group <- ggplot(data = pupil.group.level, aes(x = bin_low, y = mean.pupil.corrected.binned)) +
+  geom_vline(aes(xintercept=baseline.end), lty=2, alpha=0.3)+
+  #geom_vline(aes(xintercept=3000), lty=2, alpha=0.3)+
+  # annotate("rect", xmin = 3000, xmax = 4000, ymin =0, ymax = 1000,
+  #          alpha = .3,fill = "grey")+
+     ylab("Pupil size") +
+  xlab("Time (in ms)") +
+  geom_point(aes(x = bin_low, y = mean.pupil.corrected.binned, color = condition), alpha = 0.9, size = 0.5) +
+  geom_ribbon(aes(ymin = mean.pupil.corrected.binned - se.pupil.corrected.binned, ymax = mean.pupil.corrected.binned + se.pupil.corrected.binned, fill = condition), alpha = 0.7) +
+  xlim(3000, 8001) +
+    theme_bw()+
+  scale_color_manual(values = wes_palette("Zissou1")[c(4, 1)],
+                     labels = c("old side - new identity", "old identity - new side")) +
+  scale_fill_manual(values = wes_palette("Zissou1")[c(4, 1)],
+                    labels = c("old side - new identity", "old identity - new side")) +
+  guides(colour = guide_legend(override.aes = list(size=2)))+
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank(),
+        legend.title = element_blank(), 
+        #legend.position = "bottom",
+        legend.position = c(0.87, 0.92), 
+        legend.margin = margin(0.1,0.1,0.01,0.1),
+        legend.text=element_text(size=8),
+        legend.key.size = unit(0.4, 'cm'),
+        axis.text=element_text(size=9),
+        axis.title=element_text(size=12))+
+  facet_wrap(~agent)
+
+plot.woodward.pupil.group
+
+ggsave(plot.woodward.pupil.group, filename = "graphs/pupil_group_condition3.png", height = 5, width = 10, scale = 0.7, dpi=600)
+```
+
+#GAMM
+* Plot gaze positions
+```{r}
+emptyPlot(c(0,1024), c(768, 0), bty='o',
+          main="Gaze positions", xlab="Xgaze", ylab="Ygaze")
+points(exp.data.pupil.processed.downsampled$Xgaze, exp.data.pupil.processed.downsampled$Ygaze, pch=16, cex=.5, col=alpha(1), xpd=TRUE)
+abline(h=768/2, v=1024/2, lty=1, col='white')
+abline(h=768/2, v=1024/2, lty=2, col=1)
+```
+
+* Plot pupil size by subject
+```{r}
+par(cex=1.1, mar=c(5, 5, 2, 1), mgp=c(4,0.6,0))
+bp <- sortBoxplot(exp.data.pupil.processed.downsampled$pupil.base.corrected.binned ~ exp.data.pupil.processed.downsampled$subject, col=alpha(1), decreasing=FALSE,
+                  ylab="Pupil size", xlab="Subject", bty='n', pch=".", las=2)
+
+
+```
+#### data preparation for GAMM
+
+* select interest period
+```{r}
+dat <- exp.data.pupil.processed.downsampled%>%
+  filter(bin_low >= 4001 & bin_low <= 8001)%>% #select interest period
+  rename(pupil_base="pupil.base.corrected.binned", time="bin_low")%>%
+  arrange(subject,condition, agent, time, trial_number)%>%#order dataframe
+  droplevels() %>% 
+  mutate(test_event=ifelse(agent=="human"&condition=="new_goal", "human_new_goal",
+  ifelse(agent=="human"&condition=="new_side", "human_new_side",
+  ifelse(agent=="inanimate"&condition=="new_side", "inanimate_new_side",
+  ifelse(agent=="inanimate"&condition=="new_goal", "inanimate_new_goal","")))))
+
+dat$condition<-as.factor(dat$condition)
+dat$agent<-as.factor(dat$agent)
+dat$test_event<-as.factor(dat$test_event)
+
+levels(dat$condition)
+levels(dat$agent)
+levels(dat$test_event)
+summary(dat$test_event)
+sum(is.na(dat$test_event))
+dat$subject<-as.factor(dat$subject)
+levels(dat$subject)
+summary(dat)
+```
+#### fitting GAMM
+
+```{r}
+# Defining events (time series):
+dat$Event <- interaction(dat$subject, dat$test_event, dat$trial_number, drop=TRUE)
+levels(dat$Event)
+
+library(mgcv)
+gamm.int <- bam(pupil_base ~ condition*agent + 
+           s(time, k=20) + 
+           s(time, by= condition, k=20) +
+             #argument by: fit different smooths for different levels of a categorical variables (factor-smooth interaction)
+           s(time, by= agent, k=20) +
+           s(Xgaze, Ygaze) +
+           s(time, Event, bs='fs', m=1), 
+           #bs="fs" is for random wiggly curves: produces a smooth curve for each level of a single factor, treating the curves as entirely random
+           data=dat, discrete=TRUE, nthreads=40, method="ML") 
+
+gamm.null <- bam(pupil_base ~ s(time, k=20)+ 
+          + s(Xgaze, Ygaze)
+          + s(time, Event, bs='fs', m=1)
+          , data=dat, discrete=TRUE, nthreads=40, method="ML")
+
+#full-null model comparison 
+compareML(gamm.null, gamm.int) #AIC difference: 32.58, model gammm.int has lower AIC.
+
+AIC(gamm.int, gamm.null)
+
+summary(gamm.int)#linear interaction not significant, we remove it
+
+gamm.full <- bam(pupil_base ~ condition + agent + 
+           s(time, k=20) + 
+           s(time, by= condition, k=20) +
+           s(time, by= agent, k=20) +
+           s(Xgaze, Ygaze) +
+           s(time, Event, bs='fs', m=1), 
+           data=dat, discrete=TRUE, nthreads=40, method="ML") 
+
+
+library(mgcViz)
+gam.check(gamm.full)
+
+
+acf(resid(gamm.full), bty='n', main="ACF residuals model1")
+acf(resid(gamm.full), plot=FALSE)
+```
+
+
+```{r}
+#save gam_check
+#remotes::install_github("m-clark/visibly")
+library(visibly)
+png("graphs/pupil_gamm.full_gam_check.png", units="cm", res=600, width=24, height = 18)
+gam_check_plot<-plot_gam_check(gamm.full, scatter=TRUE)
+print(gam_check_plot)
+dev.off()
+
+png("graphs/pupil_gamm.full_acf_plot.png", units="cm", res=600, width=12, height = 12)
+acf_plot<-acf(resid(gamm.full), bty='n', main="")
+print(acf_plot)
+dev.off()
+```
+```{r}
+summary(gamm.full)
+###Fixed effects:
+#in the new side condition, the pupil is in general larger than in the new goal condition, irrespective of the agent shown (t=2.36, P=0.019).
+#Agent did not have a significant effect (t=0.47, P=0.638)
+```
+
+* difference curve
+```{r}
+#save data
+plot_diff_gamm.full_newg_news<-plot_diff(gamm.full, view="time", 
+           comp=list(condition=c("new_goal", "new_side")), rm.ranef=TRUE, 
+          las=1, ylab="Est. difference in pupil size", 
+          col=col2, hide.label = TRUE, plot = FALSE)
+
+plot_diff_gamm.full_newg_news<-ggplot(data=plot_diff_gamm.full_newg_news, aes(x=time, y=est))+
+  geom_hline(yintercept = 0)+
+  geom_path(lty=2)+
+  geom_ribbon(aes(x=time, ymin=est-CI, ymax=est+CI), alpha=0.2)+
+  theme_bw()+
+  scale_x_continuous(name="Time (in ms)", breaks=c(5000, 6000, 7000, 8000, 9000))+ ylab("Est. difference in pupil size")+ggtitle("New goal - New side")+
+    theme(panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor.y = element_blank())
+
+plot_diff_gamm.full_newg_news
+
+ggsave(plot_diff_gamm.full_newg_news, filename = "graphs/pupilsize_diff_gamm.full_condition.png", width=8, height=6, scale=0.6, dpi=600)
+
+```
+
+* plotting partial effects
+```{r}
+pdf("graphs/pupil_gamm.full_partial_effects.pdf", width=10, height = 8)
+plot(gamm.full, pages = 1, all.terms = TRUE, residuals = TRUE, rug=FALSE, pch = 1, cex = 0.5, seWithMean = TRUE, shade = TRUE, shade.col = "lightblue")
+dev.off()
+
+library(mgcViz)
+b <- getViz(gamm.full)
+png("graphs/pupil_gamm.full_partial_effect2.png", units="cm", res=600, width=24, height = 16)
+p1<-plot(b, allTerms = T)+theme_classic() + labs(title = NULL)
+print(p1, pages = 1 )
+dev.off()
+
+```
+* Summed effects
+```{r}
+
+plot_smooth(gamm.full, view="time", cond=list(condition="new_goal"), rm.ranef=TRUE,
+  v0=0, col=col2, lwd=2, lty=6, rug=FALSE, se=1.96,
+  main="Estimated effects", ylab="Pupil (baselined)", las=1)
+
+plot_smooth(gamm.full, view="time", cond=list(condition="new_side"), rm.ranef=TRUE,
+  v0=0, col=col2, lwd=2, lty=6, rug=FALSE, se=1.96,
+  main="Estimated effects", ylab="Pupil (baselined)", las=1)
+
+```
+
+```{r}
+tmp <- gamm.full$model
+plot_modelfit(gamm.full, view="time", event=tmp$Event,n = 2)
+```
